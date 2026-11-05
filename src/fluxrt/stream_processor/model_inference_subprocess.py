@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 import json
 from safetensors.torch import load_file
-from multiprocessing import Process, Value, Manager
+import multiprocessing as mp
 from queue import Empty
 from PIL import Image
 
@@ -36,9 +36,12 @@ class ModelInferenceSubprocess:
         output_batch_shared_tensor_name: str,
         pack_is_ready,
         last_processing_time,
+        is_active=None,
     ):
-        self.running = Value("b", False)
-        self.memory_reserved = Value("i", 0)
+        self.ctx = mp.get_context("spawn")
+        self.running = self.ctx.Value("b", False)
+        self.is_active = is_active or self.ctx.Value("b", False)
+        self.memory_reserved = self.ctx.Value("i", 0)
         self.process = None
         self.config = config
         self.height = self.config["resolution"]["height"]
@@ -51,9 +54,7 @@ class ModelInferenceSubprocess:
         self.pack_is_ready = pack_is_ready
         self.last_processing_time = last_processing_time
 
-        manager = Manager()
-        self.command_queue = manager.Queue()
-        self.shared_state = manager.dict()
+        self.command_queue = self.ctx.Queue()
         self.interpolation_exp = self.config.get("interpolation_exp", 1)
 
     def enable_quantization(self):
@@ -77,17 +78,17 @@ class ModelInferenceSubprocess:
 
         models_path = self.config["models_path"]
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-            f"{models_path}/scheduler", local_files_only=True, device=device
+            f"{models_path}/scheduler", local_files_only=True
         )
         self.transformer = Flux2Transformer2DModel.from_pretrained(
-            f"{models_path}/transformer", local_files_only=True, device=device
-        ).to(dtype)
+            f"{models_path}/transformer", local_files_only=True, torch_dtype=dtype
+        ).to(device)
 
         self.text_encoder = Qwen3ForCausalLM.from_pretrained(
-            f"{models_path}/text_encoder", local_files_only=True
-        ).to(device, dtype)
+            f"{models_path}/text_encoder", local_files_only=True, torch_dtype=dtype
+        ).to(device)
         self.tokenizer = Qwen2TokenizerFast.from_pretrained(
-            f"{models_path}/tokenizer", local_files_only=True, device=device
+            f"{models_path}/tokenizer", local_files_only=True
         )
 
     def load_quantized_models(self):
@@ -161,8 +162,8 @@ class ModelInferenceSubprocess:
         else:
             models_path = self.config["models_path"]
             self.vae = AutoencoderKLFlux2.from_pretrained(
-                f"{models_path}/vae", local_files_only=True, device=self.device
-            ).to(self.dtype)
+                f"{models_path}/vae", local_files_only=True, torch_dtype=self.dtype
+            ).to(self.device)
 
         if self.config.get("compile_models", False):
             self.transformer = torch.compile(
@@ -275,13 +276,18 @@ class ModelInferenceSubprocess:
 
     def start(self):
         self.running.value = True
-        self.process = Process(target=self.process_main)
+        self.process = self.ctx.Process(target=self.process_main)
         self.process.start()
 
     def stop(self):
         self.running.value = False
         if self.process:
-            self.process.join()
+            self.process.join(timeout=2.0)
+            if self.process.is_alive():
+                self.process.terminate()
+                self.process.join(timeout=1.0)
+                if self.process.is_alive():
+                    self.process.kill()
 
     def set_param(self, name: str, value) -> None:
         self.command_queue.put(("set_param", (name, value)))
@@ -479,18 +485,44 @@ class ModelInferenceSubprocess:
         return frame
 
     def process_main(self):
-        self.process_init()
-        prev_time = time.time()
-        while self.running.value:
-            self.update_process_state()
-            original_frame = self.input_shared_tensor.to_numpy()
-            original_frame = cv2.cvtColor(original_frame, cv2.COLOR_BGR2RGB)
-            frame = self.process_frame_with_pipeline(original_frame)
-            if self.lip_processor is not None and self.lip_active:
-                # Note: we are getting the latest input frame again after flux processing to reduce latency.
+        try:
+            self.process_init()
+            print("[FluxRT Inference] Warming up model pipeline...", flush=True)
+            dummy_frame = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+            _ = self.process_frame_with_pipeline(dummy_frame)
+            print("[FluxRT Inference] Model pipeline ready. Awaiting user stream...", flush=True)
+
+            was_active = False
+            prev_time = time.time()
+            while self.running.value:
+                self.update_process_state()
+                current_active = bool(self.is_active.value)
+                if not current_active:
+                    was_active = False
+                    time.sleep(0.02)
+                    prev_time = time.time()
+                    continue
+
+                if not was_active:
+                    print("[FluxRT Inference] Stream activated! Computing initial frame...", flush=True)
+                    self.update_controller.reset_cache()
+                    was_active = True
+
                 original_frame = self.input_shared_tensor.to_numpy()
                 original_frame = cv2.cvtColor(original_frame, cv2.COLOR_BGR2RGB)
-                frame = self.lip_processor.process(frame, original_frame)
-            frame = self.convert_np_to_torch(frame)
-            frames = self.interpolate_frames(frame)
-            prev_time = self.sync_fps_and_send(prev_time, frames)
+                frame = self.process_frame_with_pipeline(original_frame)
+                if self.lip_processor is not None and self.lip_active:
+                    # Note: we are getting the latest input frame again after flux processing to reduce latency.
+                    original_frame = self.input_shared_tensor.to_numpy()
+                    original_frame = cv2.cvtColor(original_frame, cv2.COLOR_BGR2RGB)
+                    frame = self.lip_processor.process(frame, original_frame)
+                frame = self.convert_np_to_torch(frame)
+                frames = self.interpolate_frames(frame)
+                prev_time = self.sync_fps_and_send(prev_time, frames)
+        except Exception as e:
+            import traceback
+            print(f"[FATAL INFERENCE ERROR]: {e}", flush=True)
+            traceback.print_exc()
+            with open("/tmp/inference_crash.log", "w") as f:
+                traceback.print_exc(file=f)
+            raise

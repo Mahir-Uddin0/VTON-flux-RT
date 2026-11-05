@@ -32,11 +32,11 @@ class StreamProcessor:
 
         self.out_resolution = {"height": out_height, "width": out_width}
 
-        multiprocessing.set_start_method("spawn", force=True)
-
-        self.pack_is_ready = Value("b", False)
-        self.last_processing_time = Value("f", 0.0)
-        self.frame_written = Value("b", False)
+        self.ctx = multiprocessing.get_context("spawn")
+        self.pack_is_ready = self.ctx.Value("b", False)
+        self.last_processing_time = self.ctx.Value("f", 0.0)
+        self.frame_written = self.ctx.Value("b", False)
+        self.is_active = self.ctx.Value("b", False)
 
         self.model_inference_subprocess = ModelInferenceSubprocess(
             self.config,
@@ -44,6 +44,7 @@ class StreamProcessor:
             self.output_batch_shared_tensor.name,
             self.pack_is_ready,
             self.last_processing_time,
+            is_active=self.is_active,
         )
 
         self.output_scheduler_subprocess = OutputSchedulerSubprocess(
@@ -110,6 +111,17 @@ class StreamProcessor:
 
     def is_ready(self) -> bool:
         return bool(self.frame_written.value)
+
+    def is_alive(self) -> bool:
+        if self.model_inference_subprocess.process is None:
+            return False
+        return self.model_inference_subprocess.process.is_alive()
+
+    def set_active(self, active: bool) -> None:
+        self.is_active.value = active
+
+    def get_active(self) -> bool:
+        return bool(self.is_active.value)
 
     def get_input_shared_tensor_name(self) -> str:
         return self.input_shared_tensor.name

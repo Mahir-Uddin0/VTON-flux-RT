@@ -1,4 +1,4 @@
-from multiprocessing import Process, Value
+import multiprocessing as mp
 from fluxrt.utils.shared_tensor import SharedTensor
 import time
 
@@ -20,7 +20,8 @@ class OutputSchedulerSubprocess:
         self.last_processing_time = last_processing_time
         self.frame_written = frame_written
 
-        self.running = Value("b", False)
+        self.ctx = mp.get_context("spawn")
+        self.running = self.ctx.Value("b", False)
         self.process = None
 
         self.interpolation_exp = self.config.get("interpolation_exp", 1)
@@ -28,13 +29,18 @@ class OutputSchedulerSubprocess:
 
     def start(self) -> None:
         self.running.value = True
-        self.process = Process(target=self.process_main)
+        self.process = self.ctx.Process(target=self.process_main)
         self.process.start()
 
     def stop(self) -> None:
         self.running.value = False
         if self.process:
-            self.process.join()
+            self.process.join(timeout=2.0)
+            if self.process.is_alive():
+                self.process.terminate()
+                self.process.join(timeout=1.0)
+                if self.process.is_alive():
+                    self.process.kill()
 
     def process_init(self) -> None:
         """
@@ -56,22 +62,31 @@ class OutputSchedulerSubprocess:
         )
 
     def process_main(self) -> None:
-        self.process_init()
+        try:
+            self.process_init()
 
-        while self.running.value:
-            if not self.pack_is_ready.value:
-                continue
+            while self.running.value:
+                if not self.pack_is_ready.value:
+                    time.sleep(0.001)
+                    continue
 
-            proc_time = min(max(self.last_processing_time.value, 0.001), 1.0)
-            sleep_interval = proc_time / self.batch_size
+                proc_time = min(max(self.last_processing_time.value, 0.001), 1.0)
+                sleep_interval = proc_time / self.batch_size
 
-            for i in range(self.batch_size):
-                self.output_shared_tensor.copy_from(
-                    self.output_batch_shared_tensor.array[i]
-                )
-                if self.frame_written is not None and not self.frame_written.value:
-                    self.frame_written.value = True
-                if i < self.batch_size - 1:
-                    time.sleep(sleep_interval)
+                for i in range(self.batch_size):
+                    self.output_shared_tensor.copy_from(
+                        self.output_batch_shared_tensor.array[i]
+                    )
+                    if self.frame_written is not None and not self.frame_written.value:
+                        self.frame_written.value = True
+                    if i < self.batch_size - 1:
+                        time.sleep(sleep_interval)
 
-            self.pack_is_ready.value = False
+                self.pack_is_ready.value = False
+        except Exception as e:
+            import traceback
+            print(f"[FATAL SCHEDULER ERROR]: {e}", flush=True)
+            traceback.print_exc()
+            with open("/tmp/scheduler_crash.log", "w") as f:
+                traceback.print_exc(file=f)
+            raise
