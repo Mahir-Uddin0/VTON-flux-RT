@@ -3,6 +3,8 @@ transformers
 numpy>=2.0
 opencv-python==4.12.0.88
 gradio==6.12.0
+uvicorn[standard]
+websockets
 accelerate
 safetensors>=0.4.0
 optimum-quanto

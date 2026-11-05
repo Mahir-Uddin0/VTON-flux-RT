@@ -1,3 +1,7 @@
+# Local TLS Certificates
+certs/
+*.pem
+
 .vscode/
 local_samples/
 experiments/
