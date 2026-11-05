@@ -7,6 +7,11 @@ import sys
 import threading
 import time
 
+# Ensure repository root is in sys.path when running as a standalone script
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
 import cv2
 import gradio as gr
 import numpy as np
@@ -15,8 +20,12 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from scripts.session_manager import SessionManager
-from scripts.ssl_utils import ensure_ssl_certificates, get_lan_ip
+try:
+    from scripts.session_manager import SessionManager
+    from scripts.ssl_utils import ensure_ssl_certificates, get_lan_ip
+except ModuleNotFoundError:
+    from session_manager import SessionManager
+    from ssl_utils import ensure_ssl_certificates, get_lan_ip
 
 from fluxrt import StreamProcessor
 from fluxrt.utils import crop_maximal_rectangle
